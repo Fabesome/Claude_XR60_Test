@@ -1,8 +1,8 @@
 #include "config.h"
 
 // Wi-Fi credentials
-const char *ssid = "Haubenhofer 2.4GHz";
-const char *password = "ouDUdlWL2SisO";
+const char *ssid = "";
+const char *password = "";
 
 // Pin Definitions
 const int NTC_PIN = 34;
