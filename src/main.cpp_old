@@ -1,0 +1,777 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <SPIFFS.h>
+#include <ArduinoJson.h>
+#include <Preferences.h>
+#include <math.h>
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME280.h>
+
+// Wi-Fi credentials
+const char *ssid = "ZTE_0A9A22";
+const char *password = "6F5H5DC453";
+
+// Create AsyncWebServer object on port 80
+AsyncWebServer server(80);
+
+// Create a Preferences object
+Preferences preferences;
+
+// Create BME280 object
+Adafruit_BME280 bme;
+
+// Pin Definitions
+const int NTC_PIN = 34; // Analog pin for NTC sensor
+const int EVAP_SENSOR_PIN = 35;  // Assuming we're using pin 35 for the evaporator sensor
+const int COMPRESSOR_RELAY_PIN = 16;
+const int DEFROST_RELAY_PIN = 17;
+const int FAN_RELAY_PIN = 18;
+const int DOOR_SENSOR_PIN = 19; // Assuming a door sensor is connected to GPIO 19
+
+// NTC parameters
+const float SERIES_RESISTOR = 10000; // 10k resistor in series with NTC
+const int ADC_MAX = 4095;            // 12-bit ADC
+
+// Steinhart-Hart coefficients (default values, will be updated by calibration)
+float A = 0.001129148;
+float B = 0.000234125;
+float C = 0.0000000876741;
+
+// Alert thresholds
+const float TEMP_HIGH_ALERT = 10.0; // High temperature alert threshold
+const float TEMP_LOW_ALERT = -5.0;  // Low temperature alert threshold
+
+// Global variables
+float currentTemperature = 0.0;
+float evaporatorTemperature = 0.0;
+bool isDefrosting = false;
+unsigned long lastDefrostTime = 0;
+
+
+
+// Alert status
+bool highTempAlert = false;
+bool lowTempAlert = false;
+
+bool useSimulatedTemperature = false;
+float simulatedTemperature = 20.0;
+
+// Struct to hold all settings
+struct Settings
+{
+  float SEt;  // Set Point
+  float Hy;   // Differential
+  float LS;   // Minimum Set Point
+  float US;   // Maximum Set Point
+  float Ot;   // Thermostat Probe Calibration
+  String P2P; // Evaporator Probe Presence
+  float OE;   // Evaporator Probe Calibration
+  int OdS;    // Outputs Activation Delay at Start Up
+  int AC;     // Anti-short Cycle Delay
+  float CCt;  // Continuous Cycle Duration
+  float CCS;  // Set Point for Continuous Cycle
+  int COn;    // Compressor ON Time with Faulty Probe
+  int COF;    // Compressor OFF Time with Faulty Probe
+  String CF;  // Temperature Measurement Unit
+  String rES; // Resolution
+  String Lod; // Probe Displayed
+  String tdF; // Defrost Type
+  String dFP; // Probe Selection for Defrost Termination
+  float dtE;  // Defrost Termination Temperature
+  int IdF;    // Interval Between Defrost Cycles
+  int MdF;    // Maximum Duration of Defrost
+  int dSd;    // Start Defrost Delay
+  String dFd; // Display During Defrost
+  int dAd;    // MAX Display Delay After Defrost
+  int Fdt;    // Draining Time
+  String dPo; // First Defrost After Start-up
+  float dAF;  // Defrost Delay After Continuous Cycle
+  String FnC; // Fan Operating Mode
+  int Fnd;    // Fan Delay After Defrost
+  float Fct;  // Temperature Differential to Avoid Short Cycles of Fans
+  float FSt;  // Fan Stop Temperature
+  String FAP; // Probe Selection for Fan Management
+  String ALC; // Temperature Alarms Configuration
+  float ALU;  // High Temperature Alarm Setting
+  float ALL;  // Low Temperature Alarm Setting
+  float AFH;  // Differential for Temperature Alarm Recovery
+  int ALd;    // Temperature Alarm Delay
+  float dAO;  // Delay of Temperature Alarm at Start Up
+  bool useBME280; // Use BME280 sensor instead of NTC
+} settings;
+
+// Data logging parameters
+const char *DATA_FILE = "/temperature_log.csv";
+const unsigned long LOG_INTERVAL = 60000; // Log every minute
+unsigned long lastLogTime = 0;
+
+// Enhanced data storage
+struct DataPoint {
+    unsigned long timestamp;
+    float temperature;
+    float evaporatorTemperature;
+    bool compressorState;
+    bool defrostState;
+    bool fanState;
+    bool doorOpen;
+};
+
+const int DATA_HISTORY_SIZE = 1440; // Store 24 hours of data at 1-minute intervals
+DataPoint dataHistory[DATA_HISTORY_SIZE];
+int dataHistoryIndex = 0;
+
+// Function prototypes
+void loadSettings();
+void saveSettings();
+float readTemperature(bool isEvaporatorSensor = false);
+void controlCompressor();
+void handleDefrost();
+void controlFan();
+void calibrateSensor(float temp1, float temp2, float temp3);
+void checkErrors();
+void checkAlerts(float temperature);
+String getAlertStatus();
+void addDataToHistory(float temperature, float evaporatorTemperature, bool compressorState, bool defrostState, bool fanState, bool doorOpen);
+String getDataJSON(unsigned long startTime, unsigned long endTime);
+void logData(float temperature, float evaporatorTemperature);
+void setupDataLogging();
+String getDefaultDataJSON();
+
+String getDefaultDataJSON() {
+    JsonDocument doc;
+    JsonArray dataArray = doc["data"].to<JsonArray>();
+    JsonObject point = dataArray.add<JsonObject>();
+    point["time"] = millis();
+    point["temp"] = 20.0;  // Default temperature
+    point["compressor"] = false;
+    point["defrost"] = false;
+    point["fan"] = false;
+    point["door"] = false;
+    String response;
+    serializeJson(doc, response);
+    return response;
+}
+
+void setup()
+{
+  Serial.begin(115200);
+
+  // Initialize SPIFFS
+  if (!SPIFFS.begin(true))
+  {
+    Serial.println("An Error has occurred while mounting SPIFFS");
+    return;
+  }
+
+  // Load settings from non-volatile memory
+  loadSettings();
+
+  // Connect to Wi-Fi
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    delay(1000);
+    Serial.println("Connecting to WiFi..");
+  }
+
+  // Print ESP32 Local IP Address
+  Serial.println(WiFi.localIP());
+
+  // Set up GPIO pins
+  pinMode(COMPRESSOR_RELAY_PIN, OUTPUT);
+  pinMode(DEFROST_RELAY_PIN, OUTPUT);
+  pinMode(FAN_RELAY_PIN, OUTPUT);
+  pinMode(DOOR_SENSOR_PIN, INPUT_PULLUP);
+
+  // Initialize BME280
+  if (!bme.begin(0x76)) {  // Adjust address if necessary
+    Serial.println("Could not find a valid BME280 sensor, check wiring!");
+  }
+
+  // Set up web server routes
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request)
+            { request->send(SPIFFS, "/index.html", String(), false); });
+
+  server.on("/temperature", HTTP_GET, [](AsyncWebServerRequest *request){
+    JsonDocument doc;
+    doc["main"] = currentTemperature;
+    if (settings.P2P == "y") {
+        doc["evaporator"] = evaporatorTemperature;
+    }
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
+});
+
+  server.on("/calibrate", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+            {
+            DynamicJsonDocument doc(1024);
+            deserializeJson(doc, data);
+            
+            float temp1 = doc["temp1"];
+            float temp2 = doc["temp2"];
+            float temp3 = doc["temp3"];
+            
+            calibrateSensor(temp1, temp2, temp3);
+            
+            request->send(200, "text/plain", "Calibration complete"); });
+
+  server.on("/data", HTTP_GET, [](AsyncWebServerRequest *request){
+    JsonDocument doc;
+    JsonArray dataArray = doc["data"].to<JsonArray>();
+    
+    JsonObject point = dataArray.add<JsonObject>();
+    point["time"] = millis();
+    point["temp"] = currentTemperature;
+    point["compressor"] = digitalRead(COMPRESSOR_RELAY_PIN) == HIGH;
+    point["defrost"] = digitalRead(DEFROST_RELAY_PIN) == HIGH;
+    point["fan"] = digitalRead(FAN_RELAY_PIN) == HIGH;
+    point["door"] = digitalRead(DOOR_SENSOR_PIN) == LOW;
+
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
+  });
+
+  server.on("/alert_status", HTTP_GET, [](AsyncWebServerRequest *request)
+            { request->send(200, "application/json", getAlertStatus()); });
+
+  server.on("/download_log", HTTP_GET, [](AsyncWebServerRequest *request)
+            { request->send(SPIFFS, DATA_FILE, "text/csv"); });
+
+  server.on("/simulate_temperature", HTTP_POST, [](AsyncWebServerRequest *request){}, NULL,
+    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+        DynamicJsonDocument doc(64);
+        deserializeJson(doc, data);
+        
+        if (doc.containsKey("temperature")) {
+            simulatedTemperature = doc["temperature"];
+            useSimulatedTemperature = true;
+            request->send(200, "application/json", "{\"status\":\"success\"}");
+        } else {
+            request->send(400, "application/json", "{\"status\":\"error\",\"message\":\"Missing temperature value\"}");
+        }
+    });
+            
+    server.on("/update_settings", HTTP_POST, [](AsyncWebServerRequest *request){}, NULL,
+    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+        JsonDocument doc;
+        deserializeJson(doc, data);
+        
+        // Update settings
+        if (doc.containsKey("SEt")) settings.SEt = doc["SEt"];
+        if (doc.containsKey("Hy")) settings.Hy = doc["Hy"];
+        if (doc.containsKey("LS")) settings.LS = doc["LS"];
+        if (doc.containsKey("US")) settings.US = doc["US"];
+        if (doc.containsKey("Ot")) settings.Ot = doc["Ot"];
+        if (doc.containsKey("P2P")) settings.P2P = doc["P2P"].as<String>();
+        if (doc.containsKey("OE")) settings.OE = doc["OE"];
+        if (doc.containsKey("OdS")) settings.OdS = doc["OdS"];
+        if (doc.containsKey("AC")) settings.AC = doc["AC"];
+        if (doc.containsKey("CCt")) settings.CCt = doc["CCt"];
+        if (doc.containsKey("CCS")) settings.CCS = doc["CCS"];
+        if (doc.containsKey("COn")) settings.COn = doc["COn"];
+        if (doc.containsKey("COF")) settings.COF = doc["COF"];
+        if (doc.containsKey("CF")) settings.CF = doc["CF"].as<String>();
+        if (doc.containsKey("rES")) settings.rES = doc["rES"].as<String>();
+        if (doc.containsKey("Lod")) settings.Lod = doc["Lod"].as<String>();
+        if (doc.containsKey("tdF")) settings.tdF = doc["tdF"].as<String>();
+        if (doc.containsKey("dFP")) settings.dFP = doc["dFP"].as<String>();
+        if (doc.containsKey("dtE")) settings.dtE = doc["dtE"];
+        if (doc.containsKey("IdF")) settings.IdF = doc["IdF"];
+        if (doc.containsKey("MdF")) settings.MdF = doc["MdF"];
+        if (doc.containsKey("dSd")) settings.dSd = doc["dSd"];
+        if (doc.containsKey("dFd")) settings.dFd = doc["dFd"].as<String>();
+        if (doc.containsKey("dAd")) settings.dAd = doc["dAd"];
+        if (doc.containsKey("Fdt")) settings.Fdt = doc["Fdt"];
+        if (doc.containsKey("dPo")) settings.dPo = doc["dPo"].as<String>();
+        if (doc.containsKey("dAF")) settings.dAF = doc["dAF"];
+        if (doc.containsKey("FnC")) settings.FnC = doc["FnC"].as<String>();
+        if (doc.containsKey("Fnd")) settings.Fnd = doc["Fnd"];
+        if (doc.containsKey("Fct")) settings.Fct = doc["Fct"];
+        if (doc.containsKey("FSt")) settings.FSt = doc["FSt"];
+        if (doc.containsKey("FAP")) settings.FAP = doc["FAP"].as<String>();
+        if (doc.containsKey("ALC")) settings.ALC = doc["ALC"].as<String>();
+        if (doc.containsKey("ALU")) settings.ALU = doc["ALU"];
+        if (doc.containsKey("ALL")) settings.ALL = doc["ALL"];
+        if (doc.containsKey("AFH")) settings.AFH = doc["AFH"];
+        if (doc.containsKey("ALd")) settings.ALd = doc["ALd"];
+        if (doc.containsKey("dAO")) settings.dAO = doc["dAO"];
+        if (doc.containsKey("useBME280")) settings.useBME280 = doc["useBME280"];
+
+        saveSettings();
+        request->send(200, "application/json", "{\"status\":\"success\"}");
+    });
+
+  server.on("/get_settings", HTTP_GET, [](AsyncWebServerRequest *request){
+    JsonDocument doc;
+    doc["SEt"] = settings.SEt;
+    doc["Hy"] = settings.Hy;
+    doc["LS"] = settings.LS;
+    doc["US"] = settings.US;
+    doc["Ot"] = settings.Ot;
+    doc["P2P"] = settings.P2P;
+    doc["OE"] = settings.OE;
+    doc["OdS"] = settings.OdS;
+    doc["AC"] = settings.AC;
+    doc["CCt"] = settings.CCt;
+    doc["CCS"] = settings.CCS;
+    doc["COn"] = settings.COn;
+    doc["COF"] = settings.COF;
+    doc["CF"] = settings.CF;
+    doc["rES"] = settings.rES;
+    doc["Lod"] = settings.Lod;
+    doc["tdF"] = settings.tdF;
+    doc["dFP"] = settings.dFP;
+    doc["dtE"] = settings.dtE;
+    doc["IdF"] = settings.IdF;
+    doc["MdF"] = settings.MdF;
+    doc["dSd"] = settings.dSd;
+    doc["dFd"] = settings.dFd;
+    doc["dAd"] = settings.dAd;
+    doc["Fdt"] = settings.Fdt;
+    doc["dPo"] = settings.dPo;
+    doc["dAF"] = settings.dAF;
+    doc["FnC"] = settings.FnC;
+    doc["Fnd"] = settings.Fnd;
+    doc["Fct"] = settings.Fct;
+    doc["FSt"] = settings.FSt;
+    doc["FAP"] = settings.FAP;
+    doc["ALC"] = settings.ALC;
+    doc["ALU"] = settings.ALU;
+    doc["ALL"] = settings.ALL;
+    doc["AFH"] = settings.AFH;
+    doc["ALd"] = settings.ALd;
+    doc["dAO"] = settings.dAO;
+    doc["useBME280"] = settings.useBME280;
+
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
+  });
+
+  server.on("/toggle_sensor", HTTP_POST, [](AsyncWebServerRequest *request){
+    settings.useBME280 = !settings.useBME280;
+    saveSettings();
+    String response = settings.useBME280 ? "Using BME280" : "Using NTC";
+    request->send(200, "text/plain", response);
+  });
+
+  // Start server
+  server.begin();
+
+  setupDataLogging();
+}
+
+void loop()
+{
+    currentTemperature = readTemperature(false);
+    Serial.printf("Current temperature: %.2f\n", currentTemperature);
+
+    if (settings.P2P == "y") {
+        evaporatorTemperature = readTemperature(true);
+        Serial.printf("Evaporator temperature: %.2f\n", evaporatorTemperature);
+    }
+
+  checkErrors();
+  checkAlerts(currentTemperature);
+
+  controlCompressor();
+  handleDefrost();
+  controlFan();
+
+  // Log data every minute
+if (millis() - lastLogTime >= LOG_INTERVAL) {
+    bool doorOpen = (digitalRead(DOOR_SENSOR_PIN) == LOW);
+    addDataToHistory(currentTemperature,
+                     settings.P2P == "y" ? evaporatorTemperature : 0.0,
+                     digitalRead(COMPRESSOR_RELAY_PIN) == HIGH,
+                     digitalRead(DEFROST_RELAY_PIN) == HIGH,
+                     digitalRead(FAN_RELAY_PIN) == HIGH,
+                     doorOpen);
+    logData(currentTemperature, evaporatorTemperature);
+    lastLogTime = millis();
+}
+
+  delay(500); // Adjust as needed
+}
+
+float readTemperature(bool isEvaporatorSensor) {
+    if (useSimulatedTemperature) {
+        Serial.printf("Using simulated temperature: %.2f\n", simulatedTemperature);
+        return simulatedTemperature;
+    }
+    
+    float temperature;
+    int sensorPin = isEvaporatorSensor ? EVAP_SENSOR_PIN : NTC_PIN;
+    
+    if (settings.useBME280 && !isEvaporatorSensor) {
+        temperature = bme.readTemperature();
+        Serial.printf("BME280 temperature reading: %.2f\n", temperature);
+    } else {
+        // NTC temperature reading code
+        int adcValue = analogRead(sensorPin);
+        float resistance = SERIES_RESISTOR / ((ADC_MAX / (float)adcValue) - 1);
+        float logR = log(resistance);
+        temperature = 1.0 / (A + B * logR + C * logR * logR * logR);
+        temperature = temperature - 273.15;  // Convert Kelvin to Celsius
+        Serial.printf("%s temperature reading: %.2f\n", 
+                      isEvaporatorSensor ? "Evaporator" : "NTC", temperature);
+    }
+    
+    // Apply offset
+    if (isEvaporatorSensor) {
+        temperature += settings.OE;
+    } else {
+        temperature += settings.Ot;
+    }
+    
+    return temperature;
+}
+
+void calibrateSensor(float temp1, float temp2, float temp3)
+{
+  // Read ADC values for each temperature point
+  int adc1 = analogRead(NTC_PIN);
+  delay(1000); // Wait for temperature to stabilize
+  int adc2 = analogRead(NTC_PIN);
+  delay(1000);
+  int adc3 = analogRead(NTC_PIN);
+
+  // Convert ADC values to resistance
+  float r1 = SERIES_RESISTOR / ((ADC_MAX / (float)adc1) - 1);
+  float r2 = SERIES_RESISTOR / ((ADC_MAX / (float)adc2) - 1);
+  float r3 = SERIES_RESISTOR / ((ADC_MAX / (float)adc3) - 1);
+
+  // Convert temperatures to Kelvin
+  float t1 = temp1 + 273.15;
+  float t2 = temp2 + 273.15;
+  float t3 = temp3 + 273.15;
+
+  // Calculate Steinhart-Hart coefficients
+  float L1 = log(r1);
+  float L2 = log(r2);
+  float L3 = log(r3);
+
+  float Y1 = 1.0 / t1;
+  float Y2 = 1.0 / t2;
+  float Y3 = 1.0 / t3;
+
+  float U2 = (Y2 - Y1) / (L2 - L1);
+  float U3 = (Y3 - Y1) / (L3 - L1);
+
+  C = (U3 - U2) / (L3 - L2) / (L1 + L2 + L3);
+  B = U2 - C * (L1 * L1 + L1 * L2 + L2 * L2);
+  A = Y1 - (B + L1 * L1 * C) * L1;
+
+  // Save calibration coefficients
+  preferences.begin("calibration", false);
+  preferences.putFloat("A", A);
+  preferences.putFloat("B", B);
+  preferences.putFloat("C", C);
+  preferences.end();
+}
+
+void controlCompressor() {
+    Serial.printf("Controlling compressor: Current temp: %.2f, Set point: %.2f, Hysteresis: %.2f\n", 
+                  currentTemperature, settings.SEt, settings.Hy);
+    if (currentTemperature > settings.SEt + settings.Hy) {
+        digitalWrite(COMPRESSOR_RELAY_PIN, HIGH);  // Turn on compressor
+        Serial.println("Compressor turned ON");
+    } else if (currentTemperature < settings.SEt) {
+        digitalWrite(COMPRESSOR_RELAY_PIN, LOW);   // Turn off compressor
+        Serial.println("Compressor turned OFF");
+    }
+}
+
+void handleDefrost()
+{
+  unsigned long currentTime = millis();
+
+  // Start defrost if it's time and we're not already defrosting
+  if (!isDefrosting && (currentTime - lastDefrostTime) > (settings.IdF * 3600000))
+  {
+    isDefrosting = true;
+    digitalWrite(DEFROST_RELAY_PIN, HIGH);
+    lastDefrostTime = currentTime;
+  }
+
+  // End defrost if maximum duration is reached or temperature is above dtE
+  if (isDefrosting &&
+      ((currentTime - lastDefrostTime) > (settings.MdF * 60000) ||
+       currentTemperature > settings.dtE))
+  {
+    isDefrosting = false;
+    digitalWrite(DEFROST_RELAY_PIN, LOW);
+  }
+}
+
+void controlFan()
+{
+  if (settings.FnC == "C_n" || settings.FnC == "C_Y")
+  {
+    // Fan runs with compressor
+    digitalWrite(FAN_RELAY_PIN, digitalRead(COMPRESSOR_RELAY_PIN));
+  }
+  else if (settings.FnC == "O_n" || settings.FnC == "O_Y")
+  {
+    // Fan runs continuously
+    digitalWrite(FAN_RELAY_PIN, HIGH);
+  }
+
+  // Turn off fan during defrost if required
+  if (isDefrosting && (settings.FnC == "C_n" || settings.FnC == "O_n"))
+  {
+    digitalWrite(FAN_RELAY_PIN, LOW);
+  }
+}
+
+void checkAlerts(float temperature)
+{
+  if (temperature > TEMP_HIGH_ALERT)
+  {
+    highTempAlert = true;
+  }
+  else if (temperature < TEMP_LOW_ALERT)
+  {
+    lowTempAlert = true;
+  }
+  else
+  {
+    highTempAlert = false;
+    lowTempAlert = false;
+  }
+}
+
+String getAlertStatus() {
+    JsonDocument doc;
+    doc["highTemp"] = highTempAlert;
+    doc["lowTemp"] = lowTempAlert;
+    String response;
+    serializeJson(doc, response);
+    return response;
+}
+
+void addDataToHistory(float temperature, float evaporatorTemperature, bool compressorState, bool defrostState, bool fanState, bool doorOpen) {
+    dataHistory[dataHistoryIndex] = {
+        millis(),
+        temperature,
+        evaporatorTemperature,
+        compressorState,
+        defrostState,
+        fanState,
+        doorOpen
+    };
+    dataHistoryIndex = (dataHistoryIndex + 1) % DATA_HISTORY_SIZE;
+}
+
+String getDataJSON(unsigned long startTime, unsigned long endTime) {
+    JsonDocument doc;
+    JsonArray data = doc["data"].to<JsonArray>();
+
+    for (int i = 0; i < DATA_HISTORY_SIZE; i++) {
+        int index = (dataHistoryIndex - 1 - i + DATA_HISTORY_SIZE) % DATA_HISTORY_SIZE;
+        if (dataHistory[index].timestamp >= startTime && dataHistory[index].timestamp <= endTime) {
+            JsonObject point = data.add<JsonObject>();
+            point["time"] = dataHistory[index].timestamp;
+            point["temp"] = dataHistory[index].temperature;
+            if (settings.P2P == "y") {
+                point["evap_temp"] = dataHistory[index].evaporatorTemperature;
+            }
+            point["compressor"] = dataHistory[index].compressorState;
+            point["defrost"] = dataHistory[index].defrostState;
+            point["fan"] = dataHistory[index].fanState;
+            point["door"] = dataHistory[index].doorOpen;
+        }
+    }
+
+    String response;
+    serializeJson(doc, response);
+    return response;
+}
+
+// Update the setupDataLogging function
+void setupDataLogging() {
+    if (!SPIFFS.exists(DATA_FILE)) {
+        File file = SPIFFS.open(DATA_FILE, FILE_WRITE);
+        if (file) {
+            file.println("Timestamp,Temperature,EvaporatorTemperature,CompressorState,DefrostState,FanState,DoorState");
+            file.close();
+        }
+    }
+}
+
+void logData(float temperature, float evaporatorTemperature) {
+    File file = SPIFFS.open(DATA_FILE, FILE_APPEND);
+    if (file) {
+        file.printf("%lu,%.2f,%.2f,%d,%d,%d,%d\n",
+                    millis(),
+                    temperature,
+                    settings.P2P == "y" ? evaporatorTemperature : 0.0,
+                    digitalRead(COMPRESSOR_RELAY_PIN) == HIGH,
+                    digitalRead(DEFROST_RELAY_PIN) == HIGH,
+                    digitalRead(FAN_RELAY_PIN) == HIGH,
+                    digitalRead(DOOR_SENSOR_PIN) == LOW);
+        file.close();
+    }
+}
+
+void loadSettings()
+{
+  preferences.begin("refrigCtrl", true);
+
+  // Load calibration coefficients
+  A = preferences.getFloat("A", A);
+  B = preferences.getFloat("B", B);
+  C = preferences.getFloat("C", C);
+
+  // Load other settings
+  settings.SEt = preferences.getFloat("SEt", -5.0);
+  settings.Hy = preferences.getFloat("Hy", 2.0);
+  settings.LS = preferences.getFloat("LS", -50.0);
+  settings.US = preferences.getFloat("US", 110.0);
+  settings.Ot = preferences.getFloat("Ot", 0.0);
+  settings.P2P = preferences.getString("P2P", "y");
+  settings.OE = preferences.getFloat("OE", 0.0);
+  settings.OdS = preferences.getInt("OdS", 0);
+  settings.AC = preferences.getInt("AC", 1);
+  settings.CCt = preferences.getFloat("CCt", 0.0);
+  settings.CCS = preferences.getFloat("CCS", -5.0);
+  settings.COn = preferences.getInt("COn", 15);
+  settings.COF = preferences.getInt("COF", 30);
+  settings.CF = preferences.getString("CF", "C");
+  settings.rES = preferences.getString("rES", "dE");
+  settings.Lod = preferences.getString("Lod", "P1");
+  settings.tdF = preferences.getString("tdF", "EL");
+  settings.dFP = preferences.getString("dFP", "P2");
+  settings.dtE = preferences.getFloat("dtE", 8.0);
+  settings.IdF = preferences.getInt("IdF", 6);
+  settings.MdF = preferences.getInt("MdF", 30);
+  settings.dSd = preferences.getInt("dSd", 0);
+  settings.dFd = preferences.getString("dFd", "it");
+  settings.dAd = preferences.getInt("dAd", 30);
+  settings.Fdt = preferences.getInt("Fdt", 0);
+  settings.dPo = preferences.getString("dPo", "n");
+  settings.dAF = preferences.getFloat("dAF", 0.0);
+  settings.FnC = preferences.getString("FnC", "o-n");
+  settings.Fnd = preferences.getInt("Fnd", 10);
+  settings.Fct = preferences.getFloat("Fct", 10.0);
+  settings.FSt = preferences.getFloat("FSt", 2.0);
+  settings.FAP = preferences.getString("FAP", "P2");
+  settings.ALC = preferences.getString("ALC", "Ab");
+  settings.ALU = preferences.getFloat("ALU", 110.0);
+  settings.ALL = preferences.getFloat("ALL", -50.0);
+  settings.AFH = preferences.getFloat("AFH", 1.0);
+  settings.ALd = preferences.getInt("ALd", 15);
+  settings.dAO = preferences.getFloat("dAO", 1.3);
+  settings.useBME280 = preferences.getBool("useBME280", false);
+
+  preferences.end();
+}
+
+void saveSettings()
+{
+  preferences.begin("refrigCtrl", false);
+
+  // Save all settings
+  preferences.putFloat("SEt", settings.SEt);
+  preferences.putFloat("Hy", settings.Hy);
+  preferences.putFloat("LS", settings.LS);
+  preferences.putFloat("US", settings.US);
+  preferences.putFloat("Ot", settings.Ot);
+  preferences.putString("P2P", settings.P2P);
+  preferences.putFloat("OE", settings.OE);
+  preferences.putInt("OdS", settings.OdS);
+  preferences.putInt("AC", settings.AC);
+  preferences.putFloat("CCt", settings.CCt);
+  preferences.putFloat("CCS", settings.CCS);
+  preferences.putInt("COn", settings.COn);
+  preferences.putInt("COF", settings.COF);
+  preferences.putString("CF", settings.CF);
+  preferences.putString("rES", settings.rES);
+  preferences.putString("Lod", settings.Lod);
+  preferences.putString("tdF", settings.tdF);
+  preferences.putString("dFP", settings.dFP);
+  preferences.putFloat("dtE", settings.dtE);
+  preferences.putInt("IdF", settings.IdF);
+  preferences.putInt("MdF", settings.MdF);
+  preferences.putInt("dSd", settings.dSd);
+  preferences.putString("dFd", settings.dFd);
+  preferences.putInt("dAd", settings.dAd);
+  preferences.putInt("Fdt", settings.Fdt);
+  preferences.putString("dPo", settings.dPo);
+  preferences.putFloat("dAF", settings.dAF);
+  preferences.putString("FnC", settings.FnC);
+  preferences.putInt("Fnd", settings.Fnd);
+  preferences.putFloat("Fct", settings.Fct);
+  preferences.putFloat("FSt", settings.FSt);
+  preferences.putString("FAP", settings.FAP);
+  preferences.putString("ALC", settings.ALC);
+  preferences.putFloat("ALU", settings.ALU);
+  preferences.putFloat("ALL", settings.ALL);
+  preferences.putFloat("AFH", settings.AFH);
+  preferences.putInt("ALd", settings.ALd);
+  preferences.putFloat("dAO", settings.dAO);
+  preferences.putBool("useBME280", settings.useBME280);
+
+  preferences.end();
+}
+
+void checkErrors()
+{
+  // Check if temperature is within expected range
+  if (currentTemperature < -50 || currentTemperature > 150)
+  {
+    Serial.println("Error: Temperature out of expected range");
+    // You might want to set an error flag or take some action here
+  }
+
+  // Check if BME280 is selected but not responding
+  if (settings.useBME280 && !bme.begin(0x76))
+  {
+    Serial.println("Error: BME280 selected but not responding");
+    // You might want to fall back to NTC or set an error flag
+  }
+
+  // Check if compressor is short cycling
+  static unsigned long lastCompressorStartTime = 0;
+  if (digitalRead(COMPRESSOR_RELAY_PIN) == HIGH && 
+      (millis() - lastCompressorStartTime) < (settings.AC * 60000))
+  {
+    Serial.println("Warning: Compressor short cycling detected");
+    // You might want to enforce a minimum off time here
+  }
+  if (digitalRead(COMPRESSOR_RELAY_PIN) == HIGH)
+  {
+    lastCompressorStartTime = millis();
+  }
+
+  // Check if defrost cycle is too long
+  if (isDefrosting && (millis() - lastDefrostTime) > (settings.MdF * 60000 * 1.1))
+  {
+    Serial.println("Warning: Defrost cycle exceeding maximum duration");
+    // You might want to force end the defrost cycle here
+  }
+
+  // Check if door has been open too long
+  static unsigned long doorOpenTime = 0;
+  if (digitalRead(DOOR_SENSOR_PIN) == LOW)
+  {
+    if (doorOpenTime == 0)
+    {
+      doorOpenTime = millis();
+    }
+    else if ((millis() - doorOpenTime) > 300000) // 5 minutes
+    {
+      Serial.println("Warning: Door has been open for more than 5 minutes");
+      // You might want to sound an alarm or take some action here
+    }
+  }
+  else
+  {
+    doorOpenTime = 0;
+  }
+}
+
