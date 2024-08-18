@@ -1,8 +1,8 @@
 #include "config.h"
 
 // Wi-Fi credentials
-const char *ssid = "Haubenhofer 2.4GHz";
-const char *password = "ouDUdlWL2SisO";
+const char *ssid = "";
+const char *password = "";
 
 // NTP Server
 const char* ntpServer = "pool.ntp.org";
@@ -39,9 +39,12 @@ bool highTempAlert = false;
 bool lowTempAlert = false;
 bool useSimulatedTemperature = false;
 float simulatedTemperature = 20.0;
+<<<<<<< HEAD
 unsigned long startupTime = 0;
 bool energySavingMode = false;
 
 // Add these definitions
 unsigned long drainingStartTime = 0;
 bool isDraining = false;
+=======
+>>>>>>> daadbed8af6a5b4ef83ad228df3e0f594acefaa5
