@@ -42,6 +42,7 @@ struct Settings {
   int ALd;    // Temperature Alarm Delay
   float dAO;  // Delay of Temperature Alarm at Start Up
   bool useBME280; // Use BME280 sensor instead of NTC
+  float HES; // Temperature Increase during Energy Saving cycle
 };
 
 extern Settings settings;

@@ -45,6 +45,7 @@ void loadSettings() {
   settings.AFH = preferences.getFloat("AFH", 1.0);
   settings.ALd = preferences.getInt("ALd", 15);
   settings.dAO = preferences.getFloat("dAO", 1.3);
+  settings.HES = preferences.getFloat("HES", 0.0);
   settings.useBME280 = preferences.getBool("useBME280", false);
 
   preferences.end();
@@ -91,6 +92,7 @@ void saveSettings() {
   preferences.putFloat("AFH", settings.AFH);
   preferences.putInt("ALd", settings.ALd);
   preferences.putFloat("dAO", settings.dAO);
+  preferences.putFloat("HES", settings.HES);
   preferences.putBool("useBME280", settings.useBME280);
 
   preferences.end();

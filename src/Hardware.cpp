@@ -11,15 +11,39 @@ float A = 0.001129148;
 float B = 0.000234125;
 float C = 0.0000000876741;
 
+// State tracking variables
+bool isCompressorOn = false;
+bool isFanOn = false;
+bool isDefrostOn = false;
+
 void setupHardware() {
   pinMode(COMPRESSOR_RELAY_PIN, OUTPUT);
   pinMode(DEFROST_RELAY_PIN, OUTPUT);
   pinMode(FAN_RELAY_PIN, OUTPUT);
   pinMode(DOOR_SENSOR_PIN, INPUT_PULLUP);
 
+  digitalWrite(COMPRESSOR_RELAY_PIN, LOW);  // Ensure compressor is initially off
+  digitalWrite(DEFROST_RELAY_PIN, LOW);  // Ensure defrost is initially off
+  digitalWrite(FAN_RELAY_PIN, LOW);  // Ensure fan is initially off
+
+  attachInterrupt(digitalPinToInterrupt(DOOR_SENSOR_PIN), handleDigitalInput, CHANGE);
+
   if (!bme.begin(0x76)) {
     Serial.println("Could not find a valid BME280 sensor, check wiring!");
   }
+}
+
+void IRAM_ATTR handleDigitalInput() {
+    static unsigned long lastInterruptTime = 0;
+    unsigned long interruptTime = millis();
+    if (interruptTime - lastInterruptTime > 200) {
+        if (energySavingMode) {
+            exitEnergySavingMode();
+        } else {
+            enterEnergySavingMode();
+        }
+    }
+    lastInterruptTime = interruptTime;
 }
 
 void setupWiFi() {
@@ -89,50 +113,120 @@ void calibrateSensor(float temp1, float temp2, float temp3) {
   A = Y1 - (B + L1 * L1 * C) * L1;
 }
 
+bool canActivateOutputs() {
+    return (millis() - startupTime) >= (settings.OdS * 1000);
+}
+
 void controlCompressor() {
-  Serial.printf("Controlling compressor: Current temp: %.2f, Set point: %.2f, Hysteresis: %.2f\n", 
-                currentTemperature, settings.SEt, settings.Hy);
-  if (currentTemperature > settings.SEt + settings.Hy) {
-    digitalWrite(COMPRESSOR_RELAY_PIN, HIGH);  // Turn on compressor
-    Serial.println("Compressor turned ON");
-  } else if (currentTemperature < settings.SEt) {
-    digitalWrite(COMPRESSOR_RELAY_PIN, LOW);   // Turn off compressor
-    Serial.println("Compressor turned OFF");
-  }
+    if (!canActivateOutputs() || isDefrosting || isDraining) {
+        return;  // Don't activate compressor yet
+    }
+
+    float effectiveSetpoint = settings.SEt;
+    if (energySavingMode) {
+        effectiveSetpoint += settings.HES;
+    }
+
+    bool shouldCompressorBeOn = false;
+
+    if (currentTemperature > effectiveSetpoint + settings.Hy) {
+        shouldCompressorBeOn = true;
+    } else if (currentTemperature < effectiveSetpoint) {
+        shouldCompressorBeOn = false;
+    } else {
+        // If temperature is between setpoint and setpoint + hysteresis,
+        // maintain the current state to prevent short cycling
+        shouldCompressorBeOn = isCompressorOn;
+    }
+
+    // Only change the compressor state if it's different from the current state
+    if (shouldCompressorBeOn != isCompressorOn) {
+        isCompressorOn = shouldCompressorBeOn;
+        digitalWrite(COMPRESSOR_RELAY_PIN, isCompressorOn ? HIGH : LOW);
+        Serial.printf("Compressor turned %s\n", isCompressorOn ? "ON" : "OFF");
+    }
+
+    // For debugging purposes
+    Serial.printf("Current temp: %.2f, Set point: %.2f, Hysteresis: %.2f, Compressor: %s", 
+                  currentTemperature, effectiveSetpoint, settings.Hy,
+                  isCompressorOn ? "ON" : "OFF");
 }
 
 void handleDefrost() {
-  unsigned long currentTime = millis();
+    if (!canActivateOutputs()) {
+        return;  // Don't activate defrost yet
+    }
 
-  // Start defrost if it's time and we're not already defrosting
-  if (!isDefrosting && (currentTime - lastDefrostTime) > (settings.IdF * 3600000)) {
-    isDefrosting = true;
-    digitalWrite(DEFROST_RELAY_PIN, HIGH);
-    lastDefrostTime = currentTime;
-  }
+    unsigned long currentTime = millis();
+    bool shouldDefrostBeOn = false;
 
-  // End defrost if maximum duration is reached or temperature is above dtE
-  if (isDefrosting &&
-      ((currentTime - lastDefrostTime) > (settings.MdF * 60000) ||
-       currentTemperature > settings.dtE)) {
-    isDefrosting = false;
-    digitalWrite(DEFROST_RELAY_PIN, LOW);
-  }
+    // Start defrost if it's time and we're not already defrosting or draining
+    if (!isDefrostOn && !isDraining && (currentTime - lastDefrostTime) > (settings.IdF * 3600000)) {
+        shouldDefrostBeOn = true;
+    }
+
+    // End defrost if maximum duration is reached or temperature is above dtE
+    if (isDefrostOn &&
+        ((currentTime - lastDefrostTime) > (settings.MdF * 60000) ||
+         evaporatorTemperature > settings.dtE)) {
+        shouldDefrostBeOn = false;
+        isDraining = true;
+        drainingStartTime = currentTime;
+    }
+
+    // Handle draining time
+    if (isDraining && (currentTime - drainingStartTime) > (settings.Fdt * 60000)) {
+        isDraining = false;
+    }
+
+    // Only change the defrost state if it's different from the current state
+    if (shouldDefrostBeOn != isDefrostOn) {
+        isDefrostOn = shouldDefrostBeOn;
+        digitalWrite(DEFROST_RELAY_PIN, isDefrostOn ? HIGH : LOW);
+        Serial.printf("Defrost turned %s\n", isDefrostOn ? "ON" : "OFF");
+        if (isDefrostOn) {
+            lastDefrostTime = currentTime;
+        }
+    }
 }
 
 void controlFan() {
-  if (settings.FnC == "C_n" || settings.FnC == "C_Y") {
-    // Fan runs with compressor
-    digitalWrite(FAN_RELAY_PIN, digitalRead(COMPRESSOR_RELAY_PIN));
-  } else if (settings.FnC == "O_n" || settings.FnC == "O_Y") {
-    // Fan runs continuously
-    digitalWrite(FAN_RELAY_PIN, HIGH);
-  }
+    if (!canActivateOutputs() || isDefrosting || isDraining) {
+        if (isFanOn) {
+            isFanOn = false;
+            digitalWrite(FAN_RELAY_PIN, LOW);
+            Serial.println("Fan turned OFF due to defrost/drain/startup delay");
+        }
+        return;
+    }
 
-  // Turn off fan during defrost if required
-  if (isDefrosting && (settings.FnC == "C_n" || settings.FnC == "O_n")) {
-    digitalWrite(FAN_RELAY_PIN, LOW);
-  }
+    bool shouldFanBeOn = false;
+    // Check if evaporator temperature is below FSt
+    if (evaporatorTemperature <= settings.FSt || settings.P2P == "n") {
+        // Check fan operating mode
+        if (settings.FnC == "C_n" || settings.FnC == "C_Y") {
+            // Fan runs with compressor
+            shouldFanBeOn = isCompressorOn;
+        } else if (settings.FnC == "O_n" || settings.FnC == "O_Y") {
+            // Fan runs continuously
+            shouldFanBeOn = true;
+        }
+
+        // Check temperature differential (Fct)
+        if (settings.Fct > 0 && (currentTemperature - evaporatorTemperature) > settings.Fct) {
+            shouldFanBeOn = true;
+        }
+    }
+
+    // Only change the fan state if it's different from the current state
+    if (shouldFanBeOn != isFanOn) {
+        isFanOn = shouldFanBeOn;
+        digitalWrite(FAN_RELAY_PIN, isFanOn ? HIGH : LOW);
+        Serial.printf("Fan turned %s\n", isFanOn ? "ON" : "OFF");
+    }
+
+
+    Serial.printf(", Fan: %s\n", isFanOn ? "ON" : "OFF");
 }
 
 void checkErrors() {
@@ -148,16 +242,15 @@ void checkErrors() {
 
   // Check if compressor is short cycling
   static unsigned long lastCompressorStartTime = 0;
-  if (digitalRead(COMPRESSOR_RELAY_PIN) == HIGH && 
-      (millis() - lastCompressorStartTime) < (settings.AC * 60000)) {
+  if (isCompressorOn && (millis() - lastCompressorStartTime) < (settings.AC * 60000)) {
     Serial.println("Warning: Compressor short cycling detected");
   }
-  if (digitalRead(COMPRESSOR_RELAY_PIN) == HIGH) {
+  if (isCompressorOn) {
     lastCompressorStartTime = millis();
   }
 
   // Check if defrost cycle is too long
-  if (isDefrosting && (millis() - lastDefrostTime) > (settings.MdF * 60000 * 1.1)) {
+  if (isDefrostOn && (millis() - lastDefrostTime) > (settings.MdF * 60000 * 1.1)) {
     Serial.println("Warning: Defrost cycle exceeding maximum duration");
   }
 
@@ -175,12 +268,55 @@ void checkErrors() {
 }
 
 void checkAlerts(float temperature) {
-  if (temperature > TEMP_HIGH_ALERT) {
-    highTempAlert = true;
-  } else if (temperature < TEMP_LOW_ALERT) {
-    lowTempAlert = true;
-  } else {
-    highTempAlert = false;
-    lowTempAlert = false;
-  }
+    float highAlarmThreshold, lowAlarmThreshold;
+
+    if (settings.ALC == "rel") {
+        // Relative alarm thresholds
+        highAlarmThreshold = settings.SEt + settings.ALU;
+        lowAlarmThreshold = settings.SEt + settings.ALL;  // ALL is typically negative
+    } else {
+        // Absolute alarm thresholds
+        highAlarmThreshold = settings.ALU;
+        lowAlarmThreshold = settings.ALL;
+    }
+
+    // Check high temperature alarm
+    if (temperature > highAlarmThreshold) {
+        if (!highTempAlert) {
+            highTempAlert = true;
+            Serial.printf("High temperature alarm activated. Temp: %.1f, Threshold: %.1f\n", temperature, highAlarmThreshold);
+        }
+    } else if (temperature < (highAlarmThreshold - settings.AFH)) {
+        if (highTempAlert) {
+            highTempAlert = false;
+            Serial.printf("High temperature alarm deactivated. Temp: %.1f, Threshold: %.1f\n", temperature, highAlarmThreshold - settings.AFH);
+        }
+    }
+
+    // Check low temperature alarm
+    if (temperature < lowAlarmThreshold) {
+        if (!lowTempAlert) {
+            lowTempAlert = true;
+            Serial.printf("Low temperature alarm activated. Temp: %.1f, Threshold: %.1f\n", temperature, lowAlarmThreshold);
+        }
+    } else if (temperature > (lowAlarmThreshold + settings.AFH)) {
+        if (lowTempAlert) {
+            lowTempAlert = false;
+            Serial.printf("Low temperature alarm deactivated. Temp: %.1f, Threshold: %.1f\n", temperature, lowAlarmThreshold + settings.AFH);
+        }
+    }
+}
+
+void enterEnergySavingMode() {
+    if (!energySavingMode) {
+        energySavingMode = true;
+        Serial.println("Entering Energy Saving Mode");
+    }
+}
+
+void exitEnergySavingMode() {
+    if (energySavingMode) {
+        energySavingMode = false;
+        Serial.println("Exiting Energy Saving Mode");
+    }
 }

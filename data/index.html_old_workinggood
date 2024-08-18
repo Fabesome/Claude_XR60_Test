@@ -6,61 +6,30 @@
     <link rel="icon" href="data:,">
     <style>
         html {font-family: Arial; display: inline-block; text-align: center;}
-        body {margin: 0; padding: 0;}
-        h1 {font-size: 2rem; color: white; margin: 0; padding: 10px 0;}
+        h1 {font-size: 2rem; color: white;}
         h2 {font-size: 1.5rem; color: white;}
         h3 {font-size: 1.2rem;}
         p {font-size: 1.2rem;}
+        body {margin: 0;}
         .topnav {overflow: hidden; background-color: #4B1D3F; color: white; font-size: 1.7rem;}
         .content {padding: 20px;}
-        .card {background-color: white; box-shadow: 2px 2px 12px 1px rgba(140,140,140,.5); padding: 10px; margin-bottom: 20px;}
+        .card {background-color: white; box-shadow: 2px 2px 12px 1px rgba(140,140,140,.5); padding: 10px;}
         .cards {max-width: 700px; margin: 0 auto; display: grid; grid-gap: 2rem; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));}
         .reading {font-size: 2.8rem;}
         .timestamp {color: #bebebe; font-size: 1rem; padding: 0; margin: 0;}
         .card-title {font-size: 1.2rem; font-weight: bold; color: #034078;}
+        .card-container {display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%;}
         .button {background-color: #87919E; border: none; color: white; padding: 15px 32px; text-align: center; text-decoration: none; display: inline-block; font-size: 16px; margin: 4px 2px; cursor: pointer;}
         .button2 {background-color: #03AC13;}
         .setpoint-controls {display: flex; align-items: center; justify-content: center;}
         .setpoint-controls input {width: 60px; text-align: center; font-size: 1.2rem;}
         .setpoint-controls button {font-size: 1.5rem; padding: 5px 10px; margin: 0 5px;}
-        
-        /* Menu Bar Styles */
-        .menu-bar {
-            background-color: #333;
-            overflow: hidden;
-        }
-        .menu-bar a {
-            float: left;
-            color: #f2f2f2;
-            text-align: center;
-            padding: 14px 16px;
-            text-decoration: none;
-            font-size: 17px;
-        }
-        .menu-bar a:hover {
-            background-color: #ddd;
-            color: black;
-        }
-        .menu-bar a.active {
-            background-color: #4CAF50;
-            color: white;
-        }
     </style>
 </head>
 <body>
     <div class="topnav">
         <h1>XR60 Web Server</h1>
     </div>
-    
-    <!-- New Menu Bar -->
-    <div class="menu-bar">
-        <a href="/" class="active">Home</a>
-        <a href="/parameters">Parameters</a>
-        <a href="/download_log" target="_blank">Download Log</a>
-        <a href="#" onclick="showSimulation()">Simulation</a>
-        <a href="#" onclick="showSetpointControl()">Setpoint Control</a>
-    </div>
-
     <div class="content">
         <div class="cards">
             <div class="card">
@@ -89,8 +58,8 @@
                 <p class="reading"><span id="door">--</span></p>
             </div>
         </div>
-        
-        <div id="setpointControl" class="card" style="display: none;">
+        <br>
+        <div class="card">
             <h3>Setpoint Control</h3>
             <div class="setpoint-controls">
                 <button id="decreaseSetpoint">-</button>
@@ -99,23 +68,18 @@
             </div>
             <button id="updateSetpoint" class="button">Update Setpoint</button>
         </div>
-        
-        <div id="simulationControl" class="card" style="display: none;">
-            <h3>Temperature Simulation</h3>
-            <p>Enter a temperature value to simulate:</p>
-            <p>
-                <input type="number" id="simulatedTemp" min="-50" max="150" step="0.1">
-                <button id="setSimulatedTemp" class="button button2">Set Temperature</button>
-            </p>
-        </div>
-        
-        <div class="card">
-            <h3>Sensor Control</h3>
-            <p>Click to toggle between BME280 and NTC sensors:</p>
-            <p><button id="toggleSensor" class="button">Toggle Sensor</button></p>
-        </div>
+        <br>
+        <h3>Sensor Control</h3>
+        <p>Click to toggle between BME280 and NTC sensors:</p>
+        <p><button id="toggleSensor" class="button">Toggle Sensor</button></p>
+        <br>
+        <h3>Temperature Simulation</h3>
+        <p>Enter a temperature value to simulate:</p>
+        <p>
+            <input type="number" id="simulatedTemp" min="-50" max="150" step="0.1">
+            <button id="setSimulatedTemp" class="button button2">Set Temperature</button>
+        </p>
     </div>
-
     <script>
         let updateInProgress = false;
         let lastReceivedData = null;
@@ -141,16 +105,6 @@
 
         function isValidTemperature(temp) {
             return typeof temp === 'number' && !isNaN(temp) && isFinite(temp) && temp > -273.15 && temp < 1000;
-        }
-
-        function showSimulation() {
-            document.getElementById('simulationControl').style.display = 'block';
-            document.getElementById('setpointControl').style.display = 'none';
-        }
-
-        function showSetpointControl() {
-            document.getElementById('setpointControl').style.display = 'block';
-            document.getElementById('simulationControl').style.display = 'none';
         }
 
         async function updateData() {
@@ -179,6 +133,7 @@
                 if (data) {
                     const { temp, compressor, defrost, fan, time, date } = data;
                     
+                    // Check if data has changed
                     if (JSON.stringify(data) !== JSON.stringify(lastReceivedData)) {
                         console.log('Data has changed');
                         lastReceivedData = data;
@@ -191,18 +146,21 @@
                     document.getElementById('defrost').textContent = defrost ? 'ON' : 'OFF';
                     document.getElementById('fan').textContent = fan ? 'ON' : 'OFF';
                     
+                    // Update timestamp
                     const formattedTimestamp = `${date} ${time}`;
                     document.getElementById('timestamp').textContent = formattedTimestamp;
                     
                     console.log('Formatted timestamp:', formattedTimestamp);
                     console.log('Raw date:', date, 'Raw time:', time);
 
+                    // Handle evaporator temperature if available
                     if ('evap_temp' in data) {
                         document.getElementById('evaporatorTemp').textContent = isValidTemperature(data.evap_temp) ? data.evap_temp.toFixed(1) : 'N/A';
                     } else {
                         document.getElementById('evaporatorTemp').textContent = 'N/A';
                     }
 
+                    // Handle door state if available
                     if ('door' in data) {
                         document.getElementById('door').textContent = data.door ? 'OPEN' : 'CLOSED';
                     } else {

@@ -6,6 +6,11 @@
 extern const char *ssid;
 extern const char *password;
 
+// NTP Server
+extern const char* ntpServer;
+extern const long  gmtOffset_sec;
+extern const int   daylightOffset_sec;
+
 // Pin Definitions
 extern const int NTC_PIN;
 extern const int EVAP_SENSOR_PIN;
@@ -38,3 +43,10 @@ extern bool highTempAlert;
 extern bool lowTempAlert;
 extern bool useSimulatedTemperature;
 extern float simulatedTemperature;
+
+extern unsigned long startupTime;
+extern bool energySavingMode;
+
+// Add these declarations
+extern unsigned long drainingStartTime;
+extern bool isDraining;

@@ -27,6 +27,11 @@ void setupWebServer() {
     request->send(200, "application/json", response);
   });
 
+  // Serve the parameters page
+  server.on("/parameters", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(SPIFFS, "/parameters.html", "text/html");
+  });
+
   // Calibrate sensor
   server.on("/calibrate", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL, 
     [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
@@ -47,6 +52,8 @@ void setupWebServer() {
       request->send(200, "text/plain", "Calibration complete");
     }
   );
+
+
 
   // Get latest data
   server.on("/data", HTTP_GET, [](AsyncWebServerRequest *request) {
